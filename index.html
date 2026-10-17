@@ -401,11 +401,29 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      cursor: grab;
+    }
+
+    .gif-thumb-wrap:active {
+      cursor: grabbing;
     }
 
     .val-tag {
       color: var(--fg-main);
       font-weight: 700;
+    }
+
+    .char-badge {
+      padding: 2px 6px;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .char-badge.warn {
+      border-color: var(--warn);
+      color: var(--warn);
     }
 
     #shareCodeBox {
@@ -414,9 +432,24 @@
       font-size: 10px;
       word-break: break-all;
     }
+
+    /* hidden offscreen container for clean image-only clipboard copy (zero text/alt attributes) */
+    #hiddenCopyContainer {
+      position: fixed;
+      left: -9999px;
+      top: -9999px;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      opacity: 0;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
+
+  <!-- hidden image-only clipboard copy target (no alt text so Discord never pastes "Generated gif") -->
+  <div id="hiddenCopyContainer" contenteditable="true" aria-hidden="true"></div>
 
   <!-- top bar -->
   <header class="topbar">
@@ -442,16 +475,19 @@
   <!-- share link & code drawer -->
   <section id="shareDrawer" class="drawer-bar">
     <div class="row-between">
-      <strong>SHAREABLE LINK &amp; CONFIG CODE</strong>
+      <div class="row">
+        <strong>SHAREABLE LINK &amp; COMPACT DISCORD CODE (&lt;2000 CHARS)</strong>
+        <span id="shareUrlLenBadge" class="char-badge">URL LENGTH: -- / 2000 CHARS</span>
+      </div>
       <button type="button" id="closeShareBtn">CLOSE [X]</button>
     </div>
     <div class="row">
-      <button type="button" id="copyShareUrlBtn" class="accent-btn">COPY SHAREABLE URL</button>
-      <button type="button" id="genShareCodeBtn">GENERATE CODE</button>
+      <button type="button" id="copyShareUrlBtn" class="accent-btn">COPY SHORT DISCORD URL</button>
+      <button type="button" id="genShareCodeBtn">GENERATE COMPACT CODE</button>
       <button type="button" id="copyShareCodeBtn">COPY CODE</button>
       <button type="button" id="loadShareCodeBtn" class="accent-btn">LOAD CODE FROM BOX</button>
     </div>
-    <textarea id="shareCodeBox" placeholder="Paste an SSSL share code here or click GENERATE CODE..."></textarea>
+    <textarea id="shareCodeBox" placeholder="Paste an SSSL share link or code here, or click COPY SHORT DISCORD URL..."></textarea>
   </section>
 
   <!-- github repo files drawer -->
@@ -702,31 +738,34 @@
 
               <div class="row" style="flex: 1; justify-content: flex-end;">
                 <button type="button" id="copyGifBtn" class="accent-btn" style="padding: 6px 12px;">
-                  COPY GIF TO CLIPBOARD (AT SELECTED FPS)
+                  GENERATE &amp; COPY GIF (AT SELECTED FPS)
                 </button>
                 <button type="button" id="downloadGifBtn" style="padding: 6px 10px;">
                   DOWNLOAD .GIF
                 </button>
+                <button type="button" id="copyStaticPngBtn" style="padding: 6px 10px;" title="Copies current frame as static PNG image to clipboard">
+                  COPY STATIC PNG FRAME
+                </button>
               </div>
             </div>
 
-            <!-- live generated gif box for instant copy / right-click copy image -->
+            <!-- live generated gif box for direct Discord drag-and-drop or download -->
             <div id="gifOutputBox" class="gif-output-box">
               <div class="row" style="gap: 10px;">
-                <div id="gifSelectableWrap" class="gif-thumb-wrap checker-bg" title="Right-click -> Copy Image">
-                  <img id="generatedGifImg" class="pixel-img" alt="Generated Sprite GIF">
+                <div id="gifSelectableWrap" class="gif-thumb-wrap checker-bg" draggable="true" title="DRAG ME DIRECTLY INTO DISCORD CHAT!">
+                  <img id="generatedGifImg" class="pixel-img" draggable="true">
                 </div>
                 <div style="display: flex; flex-direction: column; gap: 3px;">
-                  <strong id="gifMetaTitle" style="color: var(--accent);">GIF ENCODED AT 10 FPS</strong>
+                  <strong id="gifMetaTitle" style="color: var(--accent);">DRAG THIS ANIMATED GIF DIRECTLY INTO DISCORD</strong>
                   <span id="gifMetaInfo" style="color: var(--fg-muted); font-size: 11px;">
                     8 FRAMES | 64x64 PX
                   </span>
-                  <span style="color: var(--fg-muted); font-size: 10px;">
-                    TIP: COPIED TO CLIPBOARD! YOU CAN ALSO RIGHT-CLICK THE GIF PREVIEW &rarr; "COPY IMAGE".
+                  <span style="color: var(--warn); font-size: 10px;">
+                    TIP: Browsers block raw animated GIF files on Ctrl+V &mdash; DRAG the GIF image on the left straight into Discord chat (or click DOWNLOAD .GIF) to post the animated GIF!
                   </span>
                 </div>
               </div>
-              <button type="button" id="reselectGifBtn">SELECT GIF</button>
+              <button type="button" id="reselectGifBtn" class="accent-btn">DOWNLOAD .GIF FILE</button>
             </div>
           </div>
 
@@ -768,7 +807,10 @@
 
   <script id="sssl-script">
     // application state
+    const PRESET_NAMES = ['runner', 'slime', 'mech', 'coins'];
+
     const state = {
+      presetIndex: 0, // 0..3 when using a built-in preset, -1 when custom sheet loaded
       frameW: 16,
       frameH: 16,
       startFrame: 0,
@@ -813,12 +855,42 @@
     const sheetOverlayCanvas = document.getElementById('sheetOverlayCanvas');
     const sheetOverlayCtx = sheetOverlayCanvas.getContext('2d');
 
+    let lastGifBytes = null;
     let lastGifBlob = null;
-    let lastGifUrl = null;
+    let lastGifDataUrl = null;
+    let lastGifFilename = 'sssl-sprite-10fps.gif';
 
     // status bar helper
     function setStatus(msg) {
       document.getElementById('statusText').textContent = 'STATUS: ' + msg;
+    }
+
+    // binary <-> base64 / base64url helpers
+    function uint8ToBase64(bytes) {
+      let binary = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    }
+
+    function uint8ToBase64Url(bytes) {
+      return uint8ToBase64(bytes)
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    }
+
+    function base64UrlToUint8(base64Url) {
+      let b64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      while (b64.length % 4 !== 0) b64 += '=';
+      const binary = atob(b64);
+      const out = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        out[i] = binary.charCodeAt(i);
+      }
+      return out;
     }
 
     // hex to rgb helper
@@ -876,6 +948,7 @@
 
     // procedural sample spritesheets
     function generateSampleSheet(type) {
+      state.presetIndex = PRESET_NAMES.indexOf(type);
       state.offsetX = 0;
       state.offsetY = 0;
       state.padX = 0;
@@ -1415,7 +1488,11 @@
       // GIF Trailer
       writeByte(0x3b);
 
-      return new Blob([new Uint8Array(bytes)], { type: 'image/gif' });
+      const uint8 = new Uint8Array(bytes);
+      const blob = new Blob([uint8], { type: 'image/gif' });
+      const dataUrl = 'data:image/gif;base64,' + uint8ToBase64(uint8);
+
+      return { bytes: uint8, blob, dataUrl };
     }
 
     // standard GIF LZW encoder
@@ -1491,79 +1568,138 @@
       return out;
     }
 
-    // select rendered GIF DOM node for fallback copy
-    function selectGeneratedGifElement() {
-      const wrap = document.getElementById('gifSelectableWrap');
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(wrap);
-      sel.removeAllRanges();
-      sel.addRange(range);
+    // trigger file download for current encoded GIF
+    function triggerGifDownload() {
+      if (!lastGifDataUrl) {
+        const res = encodeAnimatedGIF();
+        lastGifBytes = res.bytes;
+        lastGifBlob = res.blob;
+        lastGifDataUrl = res.dataUrl;
+        lastGifFilename = `sssl-sprite-${state.fps}fps.gif`;
+      }
+      const a = document.createElement('a');
+      a.href = lastGifDataUrl;
+      a.download = lastGifFilename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      const kb = Math.max(1, (lastGifBytes.length / 1024).toFixed(1));
+      setStatus(`DOWNLOADED ${lastGifFilename} (${kb} KB)`);
     }
 
-    // build GIF, show live preview, and copy to clipboard
+    // copy current scaled frame as static PNG image (supported by all browsers on Ctrl+V in Discord)
+    async function copyStaticPngFrameToClipboard() {
+      const scale = Math.max(1, state.gifScale);
+      const outW = Math.max(1, state.frameW * scale);
+      const outH = Math.max(1, state.frameH * scale);
+      const rawFrame = getFilteredFrameCanvas(state.currentPlayFrame);
+
+      const c = document.createElement('canvas');
+      c.width = outW;
+      c.height = outH;
+      const ctx = c.getContext('2d');
+      ctx.imageSmoothingEnabled = false;
+      if (state.bgMode !== 'checker') {
+        ctx.fillStyle = state.bgMode;
+        ctx.fillRect(0, 0, outW, outH);
+      }
+      ctx.drawImage(rawFrame, 0, 0, outW, outH);
+
+      c.toBlob(async (pngBlob) => {
+        if (!pngBlob) return;
+        if (navigator.clipboard && window.ClipboardItem) {
+          try {
+            await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+            setStatus(`COPIED FRAME #${state.currentPlayFrame} AS STATIC PNG TO CLIPBOARD!`);
+            return;
+          } catch (err) {
+            // fallback below
+          }
+        }
+        setStatus('CLIPBOARD PNG BLOCKED BY BROWSER PERMISSIONS');
+      }, 'image/png');
+    }
+
+    // build GIF, show draggable Discord preview, and attempt clean image-only clipboard copy
     async function generateAndCopyGif(downloadDirectly = false) {
       setStatus('ENCODING ANIMATED GIF AT ' + state.fps + ' FPS...');
-      const blob = encodeAnimatedGIF();
+      const { bytes, blob, dataUrl } = encodeAnimatedGIF();
+      lastGifBytes = bytes;
       lastGifBlob = blob;
-
-      if (lastGifUrl) URL.revokeObjectURL(lastGifUrl);
-      lastGifUrl = URL.createObjectURL(blob);
+      lastGifDataUrl = dataUrl;
+      lastGifFilename = `sssl-sprite-${state.fps}fps.gif`;
 
       const indices = getOrderedAnimationFrameIndices();
       const outW = state.frameW * state.gifScale;
       const outH = state.frameH * state.gifScale;
-      const kb = Math.max(1, (blob.size / 1024).toFixed(1));
+      const kb = Math.max(1, (bytes.length / 1024).toFixed(1));
 
+      // Use base64 data:image/gif URL and NO alt attribute so "Generated gif" text is never copied
       const img = document.getElementById('generatedGifImg');
-      img.src = lastGifUrl;
+      img.removeAttribute('alt');
+      img.src = dataUrl;
       img.style.width = Math.min(96, outW) + 'px';
       img.style.height = 'auto';
 
       document.getElementById('gifMetaTitle').textContent =
-        `ANIMATED GIF READY @ ${state.fps} FPS (${state.loopMode.toUpperCase()})`;
+        `DRAG THIS GIF INTO DISCORD // ${state.fps} FPS (${state.loopMode.toUpperCase()})`;
       document.getElementById('gifMetaInfo').textContent =
-        `${indices.length} FRAMES | ${outW}x${outH} PX | ${kb} KB`;
+        `${indices.length} FRAMES | ${outW}x${outH} PX | ${kb} KB | FILE: ${lastGifFilename}`;
       document.getElementById('gifOutputBox').classList.add('visible');
 
       if (downloadDirectly) {
-        const a = document.createElement('a');
-        a.href = lastGifUrl;
-        a.download = `sssl-sprite-${state.fps}fps.gif`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setStatus(`DOWNLOADED sssl-sprite-${state.fps}fps.gif (${kb} KB)`);
+        triggerGifDownload();
         return;
       }
 
-      // Tier 1: Try modern ClipboardItem with image/gif
+      // Tier 1: Native ClipboardItem('image/gif') if supported by the browser
       let copiedRawGif = false;
       if (navigator.clipboard && window.ClipboardItem) {
-        try {
-          const item = new ClipboardItem({ 'image/gif': blob });
-          await navigator.clipboard.write([item]);
-          copiedRawGif = true;
-        } catch (err) {
-          copiedRawGif = false;
+        const supportsGif =
+          typeof ClipboardItem.supports === 'function' ? ClipboardItem.supports('image/gif') : false;
+        if (supportsGif) {
+          try {
+            await navigator.clipboard.write([new ClipboardItem({ 'image/gif': blob })]);
+            copiedRawGif = true;
+          } catch (err) {
+            copiedRawGif = false;
+          }
         }
       }
 
-      // Tier 2: Auto-select the rendered <img> DOM element & run execCommand('copy')
-      selectGeneratedGifElement();
-      let domCopied = false;
+      // Tier 2: Copy via hidden contenteditable containing ONLY <img src="data:image/gif;base64,..."> (no alt text!)
+      let copiedRichHtmlGif = false;
       if (!copiedRawGif) {
         try {
-          domCopied = document.execCommand('copy');
+          const hiddenDiv = document.getElementById('hiddenCopyContainer');
+          hiddenDiv.innerHTML = '';
+          const cleanImg = document.createElement('img');
+          cleanImg.src = dataUrl;
+          hiddenDiv.appendChild(cleanImg);
+
+          const sel = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(hiddenDiv);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          copiedRichHtmlGif = document.execCommand('copy');
+          sel.removeAllRanges();
+          hiddenDiv.innerHTML = '';
         } catch (e) {
-          domCopied = false;
+          copiedRichHtmlGif = false;
         }
       }
 
-      if (copiedRawGif || domCopied) {
+      if (copiedRawGif) {
         setStatus(`COPIED ${state.fps} FPS ANIMATED GIF TO CLIPBOARD (${kb} KB)!`);
+      } else if (copiedRichHtmlGif) {
+        setStatus(
+          `GIF READY @ ${state.fps} FPS (${kb} KB)! DRAG THE GIF PREVIEW DIRECTLY INTO DISCORD OR CLICK DOWNLOAD .GIF!`
+        );
       } else {
-        setStatus(`GIF GENERATED @ ${state.fps} FPS! RIGHT-CLICK THE GIF PREVIEW BELOW -> "COPY IMAGE" OR CLICK DOWNLOAD.`);
+        setStatus(
+          `GIF READY @ ${state.fps} FPS (${kb} KB)! DRAG THE GIF PREVIEW BELOW INTO DISCORD OR CLICK DOWNLOAD .GIF!`
+        );
       }
     }
 
@@ -1656,6 +1792,7 @@
       reader.onload = (ev) => {
         const img = new Image();
         img.onload = () => {
+          state.presetIndex = -1; // mark as custom spritesheet
           masterCanvas.width = img.width;
           masterCanvas.height = img.height;
           masterCtx.clearRect(0, 0, img.width, img.height);
@@ -1678,59 +1815,413 @@
       document.body.removeChild(t);
     }
 
-    // share code serializer
-    function createShareCode() {
-      const payload = {
-        w: state.frameW,
-        h: state.frameH,
-        sf: state.startFrame,
-        ef: state.endFrame,
-        ox: state.offsetX,
-        oy: state.offsetY,
-        px: state.padX,
-        py: state.padY,
-        fps: state.fps,
-        loop: state.loopMode,
-        bg: state.bgMode,
-        fx: state.filters,
-        img: masterCanvas.toDataURL('image/png')
-      };
-      return btoa(encodeURIComponent(JSON.stringify(payload)));
+    /* =========================================================================
+     * ULTRA-SHORT SHARE LINK ENCODER & DECODER (< 2000 CHARS FOR DISCORD)
+     * Uses binary header + indexed palette quantization + deflate-raw stream
+     * + automatic multi-tier resolution/palette budget loop (< 1900 chars).
+     * ========================================================================= */
+    const LOOP_MODES = ['forward', 'reverse', 'pingpong'];
+    const BG_MODES = ['checker', '#000000', '#ffffff', '#00ff00'];
+    const OUTLINE_MODES = ['off', '#ffffff', '#000000'];
+
+    async function compressBytes(uint8) {
+      if (typeof CompressionStream !== 'undefined') {
+        try {
+          const cs = new CompressionStream('deflate-raw');
+          const writer = cs.writable.getWriter();
+          writer.write(uint8);
+          writer.close();
+          const buf = await new Response(cs.readable).arrayBuffer();
+          const comp = new Uint8Array(buf);
+          if (comp.length < uint8.length) {
+            const out = new Uint8Array(comp.length + 1);
+            out[0] = 1; // 1 = deflate-raw compressed
+            out.set(comp, 1);
+            return out;
+          }
+        } catch (e) {
+          // fall back to uncompressed
+        }
+      }
+      const out = new Uint8Array(uint8.length + 1);
+      out[0] = 0; // 0 = uncompressed
+      out.set(uint8, 1);
+      return out;
     }
 
-    function loadFromShareCode(codeStr) {
+    async function decompressBytes(uint8) {
+      const isCompressed = uint8[0] === 1;
+      const body = uint8.subarray(1);
+      if (!isCompressed) return body;
+      const ds = new DecompressionStream('deflate-raw');
+      const writer = ds.writable.getWriter();
+      writer.write(body);
+      writer.close();
+      const buf = await new Response(ds.readable).arrayBuffer();
+      return new Uint8Array(buf);
+    }
+
+    function writeCommonHeader(arr, mode) {
+      const f = state.filters;
+      const loopIdx = Math.max(0, LOOP_MODES.indexOf(state.loopMode));
+      const bgIdx = Math.max(0, BG_MODES.indexOf(state.bgMode));
+      const outIdx = Math.max(0, OUTLINE_MODES.indexOf(f.outlineMode));
+
+      arr[0] = mode;
+      arr[1] = (state.frameW >> 8) & 0xff;
+      arr[2] = state.frameW & 0xff;
+      arr[3] = (state.frameH >> 8) & 0xff;
+      arr[4] = state.frameH & 0xff;
+      arr[5] = (state.startFrame >> 8) & 0xff;
+      arr[6] = state.startFrame & 0xff;
+      arr[7] = (state.endFrame >> 8) & 0xff;
+      arr[8] = state.endFrame & 0xff;
+      arr[9] = Math.min(60, Math.max(1, state.fps));
+      arr[10] = (loopIdx & 0x03) | ((bgIdx & 0x03) << 2) | ((outIdx & 0x03) << 4);
+      arr[11] =
+        (f.highContrast ? 1 : 0) |
+        (f.invert ? 2 : 0) |
+        (f.grayscale ? 4 : 0) |
+        (f.flipH ? 8 : 0) |
+        (f.flipV ? 16 : 0);
+      arr[12] = (f.contrast >> 8) & 0xff;
+      arr[13] = f.contrast & 0xff;
+      arr[14] = (f.hue >> 8) & 0xff;
+      arr[15] = f.hue & 0xff;
+      arr[16] = Math.min(255, Math.max(0, f.brightness));
+      arr[17] = Math.min(255, Math.max(0, Math.round(f.saturation / 2)));
+      arr[18] = Math.min(16, Math.max(1, f.crush));
+    }
+
+    function readCommonHeader(arr) {
+      state.frameW = Math.max(1, (arr[1] << 8) | arr[2]);
+      state.frameH = Math.max(1, (arr[3] << 8) | arr[4]);
+      state.startFrame = (arr[5] << 8) | arr[6];
+      state.endFrame = (arr[7] << 8) | arr[8];
+      state.fps = Math.min(60, Math.max(1, arr[9] || 10));
+      state.loopMode = LOOP_MODES[arr[10] & 0x03] || 'forward';
+      state.bgMode = BG_MODES[(arr[10] >> 2) & 0x03] || 'checker';
+
+      const f = state.filters;
+      f.outlineMode = OUTLINE_MODES[(arr[10] >> 4) & 0x03] || 'off';
+      f.highContrast = Boolean(arr[11] & 1);
+      f.invert = Boolean(arr[11] & 2);
+      f.grayscale = Boolean(arr[11] & 4);
+      f.flipH = Boolean(arr[11] & 8);
+      f.flipV = Boolean(arr[11] & 16);
+      f.contrast = (arr[12] << 8) | arr[13];
+      f.hue = (arr[14] << 8) | arr[15];
+      f.brightness = arr[16];
+      f.saturation = arr[17] * 2;
+      f.crush = arr[18] || 16;
+    }
+
+    function buildCustomSpritePacket(maxColors, scaleRatio, fourBit) {
+      const sFrame = Math.max(0, state.startFrame);
+      const eFrame = Math.min(state.totalFrames - 1, Math.max(sFrame, state.endFrame));
+      const numFrames = Math.max(1, eFrame - sFrame + 1);
+
+      const encW = Math.max(1, Math.round(state.frameW * scaleRatio));
+      const encH = Math.max(1, Math.round(state.frameH * scaleRatio));
+
+      const strip = document.createElement('canvas');
+      strip.width = encW * numFrames;
+      strip.height = encH;
+      const sCtx = strip.getContext('2d', { willReadFrequently: true });
+      sCtx.imageSmoothingEnabled = false;
+
+      for (let i = 0; i < numFrames; i++) {
+        const r = getFrameCoords(sFrame + i);
+        sCtx.drawImage(
+          masterCanvas,
+          r.x, r.y, r.w, r.h,
+          i * encW, 0, encW, encH
+        );
+      }
+
+      const rgba = sCtx.getImageData(0, 0, strip.width, strip.height).data;
+      const totalPixels = strip.width * strip.height;
+
+      // Quantize colors (bit-shift to group similar shades when needed)
+      const colorFreq = new Map();
+      const shift = maxColors <= 15 ? 3 : 2;
+      for (let p = 0; p < rgba.length; p += 4) {
+        if (rgba[p + 3] < 128) continue;
+        const qr = (rgba[p] >> shift) << shift;
+        const qg = (rgba[p + 1] >> shift) << shift;
+        const qb = (rgba[p + 2] >> shift) << shift;
+        const key = (qr << 16) | (qg << 8) | qb;
+        colorFreq.set(key, (colorFreq.get(key) || 0) + 1);
+      }
+
+      const sorted = Array.from(colorFreq.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, maxColors);
+
+      const palCount = sorted.length;
+      const palRgb = new Uint8Array(palCount * 3);
+      for (let i = 0; i < palCount; i++) {
+        const c = sorted[i][0];
+        palRgb[i * 3] = (c >> 16) & 255;
+        palRgb[i * 3 + 1] = (c >> 8) & 255;
+        palRgb[i * 3 + 2] = c & 255;
+      }
+
+      const lookupCache = new Map();
+      function mapPixelToIndex(r, g, b) {
+        if (palCount === 0) return 0;
+        const key = (r << 16) | (g << 8) | b;
+        if (lookupCache.has(key)) return lookupCache.get(key);
+        let bestIdx = 1;
+        let bestDist = Infinity;
+        for (let i = 0; i < palCount; i++) {
+          const dr = r - palRgb[i * 3];
+          const dg = g - palRgb[i * 3 + 1];
+          const db = b - palRgb[i * 3 + 2];
+          const d = dr * dr + dg * dg + db * db;
+          if (d < bestDist) {
+            bestDist = d;
+            bestIdx = i + 1;
+            if (d === 0) break;
+          }
+        }
+        lookupCache.set(key, bestIdx);
+        return bestIdx;
+      }
+
+      const indices = new Uint8Array(totalPixels);
+      for (let p = 0, idx = 0; p < rgba.length; p += 4, idx++) {
+        if (rgba[p + 3] < 128) {
+          indices[idx] = 0;
+        } else {
+          indices[idx] = mapPixelToIndex(rgba[p], rgba[p + 1], rgba[p + 2]);
+        }
+      }
+
+      let pixelBytes;
+      if (fourBit) {
+        pixelBytes = new Uint8Array(Math.ceil(totalPixels / 2));
+        for (let i = 0; i < totalPixels; i += 2) {
+          const hi = indices[i] & 0x0f;
+          const lo = (i + 1 < totalPixels ? indices[i + 1] : 0) & 0x0f;
+          pixelBytes[i >> 1] = (hi << 4) | lo;
+        }
+      } else {
+        pixelBytes = indices;
+      }
+
+      const headerSize = 26;
+      const packet = new Uint8Array(headerSize + palRgb.length + pixelBytes.length);
+      writeCommonHeader(packet, fourBit ? 2 : 1);
+      // Normalize startFrame/endFrame in packet to 0..numFrames-1 since strip is cropped
+      packet[5] = 0;
+      packet[6] = 0;
+      packet[7] = ((numFrames - 1) >> 8) & 0xff;
+      packet[8] = (numFrames - 1) & 0xff;
+
+      packet[19] = (numFrames >> 8) & 0xff;
+      packet[20] = numFrames & 0xff;
+      packet[21] = (encW >> 8) & 0xff;
+      packet[22] = encW & 0xff;
+      packet[23] = (encH >> 8) & 0xff;
+      packet[24] = encH & 0xff;
+      packet[25] = palCount;
+
+      packet.set(palRgb, headerSize);
+      packet.set(pixelBytes, headerSize + palRgb.length);
+      return packet;
+    }
+
+    function updateShareCharBadge(urlLength) {
+      const badge = document.getElementById('shareUrlLenBadge');
+      if (!badge) return;
+      const ok = urlLength <= 2000;
+      badge.textContent = `URL LENGTH: ${urlLength} / 2000 CHARS [${ok ? 'DISCORD OK' : 'OVER LIMIT'}]`;
+      badge.classList.toggle('warn', !ok);
+    }
+
+    async function createShareCodeAsync() {
+      const baseUrl = window.location.href.split('#')[0];
+
+      // Fast path: Built-in preset sheet -> tiny 26-byte packet (~45 chars total!)
+      if (state.presetIndex >= 0) {
+        const packet = new Uint8Array(26);
+        writeCommonHeader(packet, 0);
+        packet[19] = state.presetIndex;
+        packet[20] = (state.offsetX >> 8) & 0xff;
+        packet[21] = state.offsetX & 0xff;
+        packet[22] = (state.offsetY >> 8) & 0xff;
+        packet[23] = state.offsetY & 0xff;
+        packet[24] = Math.min(255, state.padX);
+        packet[25] = Math.min(255, state.padY);
+
+        const comp = await compressBytes(packet);
+        const code = uint8ToBase64Url(comp);
+        updateShareCharBadge((baseUrl + '#s=' + code).length);
+        return code;
+      }
+
+      // Custom spritesheet path: progressively tighten palette/resolution until URL < 1900 chars
+      const tiers = [
+        { colors: 63, scale: 1.0, fourBit: false },
+        { colors: 31, scale: 1.0, fourBit: false },
+        { colors: 15, scale: 1.0, fourBit: true },
+        { colors: 15, scale: 0.75, fourBit: true },
+        { colors: 15, scale: 0.5, fourBit: true },
+        { colors: 15, scale: 0.35, fourBit: true },
+        { colors: 15, scale: 0.25, fourBit: true },
+        { colors: 15, scale: 0.18, fourBit: true },
+        { colors: 15, scale: 0.12, fourBit: true }
+      ];
+
+      let bestCode = '';
+      for (let i = 0; i < tiers.length; i++) {
+        const t = tiers[i];
+        const packet = buildCustomSpritePacket(t.colors, t.scale, t.fourBit);
+        const comp = await compressBytes(packet);
+        bestCode = uint8ToBase64Url(comp);
+        const fullLen = (baseUrl + '#s=' + bestCode).length;
+        if (fullLen <= 1900) {
+          updateShareCharBadge(fullLen);
+          return bestCode;
+        }
+      }
+
+      updateShareCharBadge((baseUrl + '#s=' + bestCode).length);
+      return bestCode;
+    }
+
+    async function loadFromShareCode(codeStr) {
+      const trimmed = codeStr.trim();
+      // Legacy fallback for old #sssl= links
+      if (trimmed.includes('#sssl=') || (!trimmed.includes('#s=') && trimmed.length > 2200)) {
+        try {
+          const clean = trimmed.replace(/^.*#sssl=/, '');
+          const data = JSON.parse(decodeURIComponent(atob(clean)));
+          const img = new Image();
+          img.onload = () => {
+            state.presetIndex = -1;
+            masterCanvas.width = img.width;
+            masterCanvas.height = img.height;
+            masterCtx.clearRect(0, 0, img.width, img.height);
+            masterCtx.drawImage(img, 0, 0);
+            state.frameW = data.w || 16;
+            state.frameH = data.h || 16;
+            state.startFrame = data.sf || 0;
+            state.endFrame = data.ef || 0;
+            state.offsetX = data.ox || 0;
+            state.offsetY = data.oy || 0;
+            state.padX = data.px || 0;
+            state.padY = data.py || 0;
+            state.fps = data.fps || 10;
+            state.loopMode = data.loop || 'forward';
+            state.bgMode = data.bg || 'checker';
+            if (data.fx) Object.assign(state.filters, data.fx);
+            syncInputsFromState();
+            syncFilterInputsFromState();
+            recalcFrames(false);
+            setStatus('LOADED PROJECT FROM LEGACY SHARE CODE');
+          };
+          img.src = data.img;
+          return;
+        } catch (err) {
+          setStatus('ERROR: INVALID SHARE CODE');
+          return;
+        }
+      }
+
       try {
-        const clean = codeStr.trim().replace(/^.*#sssl=/, '');
-        const data = JSON.parse(decodeURIComponent(atob(clean)));
+        const clean = trimmed.replace(/^.*#s=/, '');
+        const rawBytes = base64UrlToUint8(clean);
+        const packet = await decompressBytes(rawBytes);
+        const mode = packet[0];
 
-        const img = new Image();
-        img.onload = () => {
-          masterCanvas.width = img.width;
-          masterCanvas.height = img.height;
-          masterCtx.clearRect(0, 0, img.width, img.height);
-          masterCtx.drawImage(img, 0, 0);
-
-          state.frameW = data.w || 16;
-          state.frameH = data.h || 16;
-          state.startFrame = data.sf || 0;
-          state.endFrame = data.ef || 0;
-          state.offsetX = data.ox || 0;
-          state.offsetY = data.oy || 0;
-          state.padX = data.px || 0;
-          state.padY = data.py || 0;
-          state.fps = data.fps || 10;
-          state.loopMode = data.loop || 'forward';
-          state.bgMode = data.bg || 'checker';
-          if (data.fx) Object.assign(state.filters, data.fx);
-
+        if (mode === 0) {
+          // Preset mode
+          const presetIdx = packet[19] || 0;
+          const presetName = PRESET_NAMES[presetIdx] || 'runner';
+          document.getElementById('sampleSelect').value = presetName;
+          generateSampleSheet(presetName);
+          readCommonHeader(packet);
+          state.offsetX = (packet[20] << 8) | packet[21];
+          state.offsetY = (packet[22] << 8) | packet[23];
+          state.padX = packet[24] || 0;
+          state.padY = packet[25] || 0;
           syncInputsFromState();
           syncFilterInputsFromState();
           recalcFrames(false);
-          setStatus('LOADED PROJECT FROM SHARE CODE');
-        };
-        img.src = data.img;
+          setStatus('LOADED PRESET CONFIG FROM COMPACT SHARE LINK');
+        } else if (mode === 1 || mode === 2) {
+          // Custom quantized strip mode
+          state.presetIndex = -1;
+          readCommonHeader(packet);
+          state.offsetX = 0;
+          state.offsetY = 0;
+          state.padX = 0;
+          state.padY = 0;
+
+          const numFrames = Math.max(1, (packet[19] << 8) | packet[20]);
+          const encW = Math.max(1, (packet[21] << 8) | packet[22]);
+          const encH = Math.max(1, (packet[23] << 8) | packet[24]);
+          const palCount = packet[25];
+          const headerSize = 26;
+
+          const palRgb = packet.subarray(headerSize, headerSize + palCount * 3);
+          const pixData = packet.subarray(headerSize + palCount * 3);
+
+          const totalPixels = numFrames * encW * encH;
+          const stripCanvas = document.createElement('canvas');
+          stripCanvas.width = numFrames * encW;
+          stripCanvas.height = encH;
+          const sCtx = stripCanvas.getContext('2d');
+          const imgData = sCtx.createImageData(stripCanvas.width, stripCanvas.height);
+          const rgba = imgData.data;
+
+          for (let i = 0; i < totalPixels; i++) {
+            let palIdx = 0;
+            if (mode === 2) {
+              const byteVal = pixData[i >> 1] || 0;
+              palIdx = (i & 1) === 0 ? (byteVal >> 4) & 0x0f : byteVal & 0x0f;
+            } else {
+              palIdx = pixData[i] || 0;
+            }
+
+            if (palIdx > 0 && palIdx <= palCount) {
+              const pOff = (palIdx - 1) * 3;
+              rgba[i * 4] = palRgb[pOff];
+              rgba[i * 4 + 1] = palRgb[pOff + 1];
+              rgba[i * 4 + 2] = palRgb[pOff + 2];
+              rgba[i * 4 + 3] = 255;
+            }
+          }
+          sCtx.putImageData(imgData, 0, 0);
+
+          // Restore to original frameW x frameH via nearest-neighbor scaling
+          masterCanvas.width = numFrames * state.frameW;
+          masterCanvas.height = state.frameH;
+          masterCtx.imageSmoothingEnabled = false;
+          masterCtx.clearRect(0, 0, masterCanvas.width, masterCanvas.height);
+
+          for (let f = 0; f < numFrames; f++) {
+            masterCtx.drawImage(
+              stripCanvas,
+              f * encW, 0, encW, encH,
+              f * state.frameW, 0, state.frameW, state.frameH
+            );
+          }
+
+          state.startFrame = 0;
+          state.endFrame = numFrames - 1;
+          syncInputsFromState();
+          syncFilterInputsFromState();
+          recalcFrames(false);
+          setStatus('LOADED CUSTOM SPRITESHEET FROM COMPACT SHARE LINK');
+        }
+
+        const baseUrl = window.location.href.split('#')[0];
+        updateShareCharBadge((baseUrl + '#s=' + clean).length);
       } catch (err) {
-        setStatus('ERROR: INVALID SHARE CODE');
+        setStatus('ERROR: INVALID OR CORRUPTED SHARE CODE');
       }
     }
 
@@ -1752,6 +2243,10 @@
       const inlineScript = bodyClone.querySelector('#sssl-script');
       if (inlineScript) inlineScript.remove();
       bodyClone.querySelectorAll('.drawer-bar').forEach((d) => d.classList.remove('open'));
+      const gifBox = bodyClone.querySelector('#gifOutputBox');
+      if (gifBox) gifBox.classList.remove('visible');
+      const gifImg = bodyClone.querySelector('#generatedGifImg');
+      if (gifImg) gifImg.removeAttribute('src');
 
       return [
         '<!DOCTYPE html>',
@@ -2027,11 +2522,37 @@
       document.getElementById('downloadGifBtn').addEventListener('click', () => {
         generateAndCopyGif(true);
       });
-      document.getElementById('reselectGifBtn').addEventListener('click', () => {
-        selectGeneratedGifElement();
-        document.execCommand('copy');
-        setStatus('SELECTED GIF ELEMENT & COPIED');
+      document.getElementById('copyStaticPngBtn').addEventListener('click', () => {
+        copyStaticPngFrameToClipboard();
       });
+      document.getElementById('reselectGifBtn').addEventListener('click', () => {
+        triggerGifDownload();
+      });
+
+      // Native drag-and-drop of the encoded GIF file straight into Discord desktop/web
+      const setupGifDragStart = (el) => {
+        el.addEventListener('dragstart', (e) => {
+          if (!lastGifDataUrl || !lastGifBytes) return;
+          if (e.dataTransfer) {
+            e.dataTransfer.effectAllowed = 'copy';
+            e.dataTransfer.setData(
+              'DownloadURL',
+              `image/gif:${lastGifFilename}:${lastGifDataUrl}`
+            );
+            try {
+              if (e.dataTransfer.items) {
+                const gifFile = new File([lastGifBytes], lastGifFilename, { type: 'image/gif' });
+                e.dataTransfer.items.add(gifFile);
+              }
+            } catch (err) {
+              // DownloadURL fallback handles Chrome/Edge/Brave desktop drag
+            }
+          }
+          setStatus(`DRAGGING ${lastGifFilename} -> DROP INTO DISCORD CHAT!`);
+        });
+      };
+      setupGifDragStart(document.getElementById('gifSelectableWrap'));
+      setupGifDragStart(document.getElementById('generatedGifImg'));
 
       // spritesheet overview interaction
       document.getElementById('showSheetGridToggle').addEventListener('change', (e) => {
@@ -2072,28 +2593,33 @@
       });
 
       // share controls
-      document.getElementById('genShareCodeBtn').addEventListener('click', () => {
-        document.getElementById('shareCodeBox').value = createShareCode();
-        setStatus('GENERATED SHARE CODE');
+      document.getElementById('genShareCodeBtn').addEventListener('click', async () => {
+        const code = await createShareCodeAsync();
+        const baseUrl = window.location.href.split('#')[0];
+        document.getElementById('shareCodeBox').value = baseUrl + '#s=' + code;
+        setStatus('GENERATED COMPACT SHARE LINK (< 2000 CHARS)');
       });
-      document.getElementById('copyShareCodeBtn').addEventListener('click', () => {
+      document.getElementById('copyShareCodeBtn').addEventListener('click', async () => {
         const box = document.getElementById('shareCodeBox');
-        if (!box.value) box.value = createShareCode();
+        if (!box.value) {
+          const code = await createShareCodeAsync();
+          box.value = code;
+        }
         copyTextToClipboard(box.value);
-        setStatus('COPIED SHARE CODE TO CLIPBOARD');
+        setStatus('COPIED COMPACT SHARE CODE TO CLIPBOARD');
       });
       document.getElementById('loadShareCodeBtn').addEventListener('click', () => {
         const code = document.getElementById('shareCodeBox').value;
         if (code) loadFromShareCode(code);
       });
-      document.getElementById('copyShareUrlBtn').addEventListener('click', () => {
-        const code = createShareCode();
-        document.getElementById('shareCodeBox').value = code;
+      document.getElementById('copyShareUrlBtn').addEventListener('click', async () => {
+        const code = await createShareCodeAsync();
         const baseUrl = window.location.href.split('#')[0];
-        const shareUrl = baseUrl + '#sssl=' + code;
-        window.location.hash = 'sssl=' + code;
+        const shareUrl = baseUrl + '#s=' + code;
+        document.getElementById('shareCodeBox').value = shareUrl;
+        window.location.hash = 's=' + code;
         copyTextToClipboard(shareUrl);
-        setStatus('SHARE LINK COPIED TO CLIPBOARD');
+        setStatus(`SHORT DISCORD LINK COPIED (${shareUrl.length} / 2000 CHARS)!`);
       });
     }
 
@@ -2102,7 +2628,11 @@
       initEvents();
       generateSampleSheet('runner');
 
-      if (window.location.hash.startsWith('#sssl=')) {
+      if (window.location.hash.startsWith('#s=')) {
+        const code = window.location.hash.slice(3);
+        document.getElementById('shareCodeBox').value = window.location.href;
+        loadFromShareCode(code);
+      } else if (window.location.hash.startsWith('#sssl=')) {
         const code = window.location.hash.slice(6);
         document.getElementById('shareCodeBox').value = code;
         loadFromShareCode(code);
